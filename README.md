@@ -5,6 +5,7 @@ It is usefull in case you update widely used lib and want to restart only the af
 In case the system is using systemd, it will also suggest which services are affected.
 
 THIS PROGRAM IS MEANT TO BE RUN BY ROOT
+
 This is because lsof's output is very partial with regular user.
 
 To compile:
