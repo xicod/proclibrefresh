@@ -31,10 +31,14 @@ typedef struct {
 	char filename[256];
 } lsof_entry;
 
+enum init_system {SYSTEMD, OPENRC, UNIDENTIFIED};
+
 using namespace std;
 
 unordered_map<pid_t, char*> pid_service_map;
 set<char*> services_to_restart;
+
+enum init_system my_init_system;
 
 void handle_service_to_restart_set (pid_t pid){
 	unordered_map<pid_t, char*>::const_iterator it = pid_service_map.find(pid);
@@ -142,18 +146,11 @@ void handle_procs_file (unordered_map<pid_t, char*> *map, char *filepathandname)
 	FILE *fp = NULL;
 	char buff[128];
 	pid_t pid;
-	char *dot;	
 	char *servicename;
 	char service_name_used = 0;
 
 	servicename = extract_service_name_from_path(filepathandname);
-
-	dot = strrchr(servicename, '.');
 	
-	if ( !dot || strcmp(dot, ".service") != 0 ){
-		goto cleanup;
-	}
-
 	if ( (fp = fopen(filepathandname, "r")) == NULL ){
 		perror("");
 		goto cleanup;
@@ -202,18 +199,78 @@ void find_and_populate_pid_service_map (unordered_map<pid_t, char*> *map, const 
 	}
 }
 
+char *alloc_string (const char *str){
+	char *ret = (char*)(malloc(strlen(str)+1));
+	strcpy(ret, str);
+
+	return ret;
+}
+
+char *get_base_proc_path(){
+	const char *init_pid_path = "/proc/1/exe";
+
+	const char *base_path_systemd = "/sys/fs/cgroup/systemd/system.slice";
+	const char *base_path_openrc = "/sys/fs/cgroup/openrc";
+
+	struct stat file_stat;
+	char buff[1024];
+	ssize_t len;
+	int stat_ret;
+	char *ret;
+
+	strcpy(buff, init_pid_path);
+
+	while (1){
+		if ( (len = readlink(buff, buff, sizeof(buff)-1)) == -1 ) {
+			return NULL;
+		}
+		
+		buff[len] = '\0';
+
+		if ( (stat_ret = lstat(buff, &file_stat)) != 0 ){
+			return NULL;
+		}
+		
+		if ( (file_stat.st_mode & S_IFMT) == S_IFREG ){
+			break;
+		}
+	}
+
+	if ( strstr(buff, "systemd") != NULL ){
+		printf ("\nSeems you are using systemd (%s)\n\n", buff);
+		ret = alloc_string(base_path_systemd);
+		my_init_system = SYSTEMD;
+	} else if ( strstr(buff, "init") != NULL ){
+		printf ("\nSeems you are using OpenRC (%s)\n\n", buff);
+		ret = alloc_string(base_path_openrc);
+		my_init_system = OPENRC;
+	} else {
+		printf ("\nI can't identify init system '%s'\n\n", buff);
+		my_init_system = UNIDENTIFIED;
+		return NULL;
+	}
+	
+	return ret;
+}
+
 void build_pid_service_assoc_map(){
-	const char *base_path = "/sys/fs/cgroup/systemd/system.slice";
 	const char *procs_file_name = "cgroup.procs";
 
 	DIR *dir;
+	char *base_path;
+
+	if ( (base_path = get_base_proc_path()) == NULL ){
+		return;
+	}
 
 	if ( (dir = opendir(base_path)) == NULL ){
-		printf ("\nThe path %s doesn't exist.\nIs this a systemd system?\n\n", base_path);
+		printf ("\nThe path %s doesn't exist.\nWrongly identified init system?\n\n", base_path);
 	}else{
 		closedir(dir);
 		find_and_populate_pid_service_map(&pid_service_map, base_path, procs_file_name);
 	}
+
+	free(base_path);
 }
 
 void free_pid_service_map(){
@@ -260,38 +317,120 @@ long do_lsof (){
 	return entry.id;
 }
 
-void handle_service_restart_hint(){
-	const char *cmd_base = "systemctl restart ";
+char **get_services_restart_cmd_systemd (){
+	const char *cmd_base_systemd = "systemctl restart ";
 	char *cmd_str;
+	char **cmds;
 	set<char*>::iterator it;
-	char ans;
+	
+	cmds = (char**)(malloc(sizeof(char*) *2));
 
-	cmd_str = (char*)(malloc(strlen(cmd_base)+1));
-	strcpy(cmd_str, cmd_base);
+	cmd_str = (char*)(malloc(strlen(cmd_base_systemd)+1));
+	strcpy(cmd_str, cmd_base_systemd);
 
 	it = services_to_restart.begin();
 	
 	if (it != services_to_restart.end()){
-		printf ("You should probably run:\n\n");
 		while (it!=services_to_restart.end()){
 			cmd_str = (char*)(realloc(cmd_str, strlen(cmd_str) + strlen(*it) +2));
 			strcat(cmd_str, *it);
 			strcat(cmd_str, " ");
 			++it;
 		}
-		printf ("%s\n\n", cmd_str);
-		printf ("Would like to do it now? [y/n] ");
-		scanf ("%c", &ans);
 
-		if (ans == 'y' || ans == 'Y'){
-			printf ("\nRunning systemctl restart command..\n\n");
-			system(cmd_str);
-			printf ("\nDone\n\n");
+		cmds[0] = cmd_str;
+		cmds[1] = NULL;
+	}else{
+		cmds[0] = NULL;
+	}
+	
+	return cmds;
+}
+
+char **get_services_restart_cmds_openrc (){
+	const char *cmd_prefix = "rc-service ";
+	const char *cmd_suffix = " restart";
+
+	int cmd_size;
+	char *cmd;
+	char **cmds;
+	int cmds_last_entry_index;
+	set<char*>::iterator it;
+
+	cmds_last_entry_index = 0;
+	cmds = (char**)(malloc(sizeof(char*)));
+	cmds[cmds_last_entry_index] = NULL;
+
+	it = services_to_restart.begin();
+	if (it != services_to_restart.end()){
+		while (it!=services_to_restart.end()){
+			cmd_size = strlen(cmd_prefix) + strlen(*it) + strlen(cmd_suffix)+1;
+			cmd = (char*)(malloc(cmd_size));
+			snprintf (cmd, cmd_size, "%s%s%s", cmd_prefix, *it, cmd_suffix);
+
+			cmds = (char**)(realloc(cmds, sizeof(char*)*(cmds_last_entry_index+2)));
+			cmds[cmds_last_entry_index++] = cmd;
+			cmds[cmds_last_entry_index] = NULL;
+
+			++it;
 		}
-
 	}
 
-	free(cmd_str);
+	return cmds;
+
+}
+
+char **get_services_restart_cmds (){
+	
+	char **cmds;	
+
+	if (my_init_system == SYSTEMD) {
+		cmds = get_services_restart_cmd_systemd();
+	}else if (my_init_system == OPENRC){
+		cmds = get_services_restart_cmds_openrc();
+	} else {
+		cmds = (char**)(malloc(1));
+		cmds[0] = NULL;
+	}
+
+	return cmds;
+}
+
+void handle_service_restart_hint(){
+	char ans;
+	char **cmds;
+	int i;
+
+	cmds = get_services_restart_cmds();
+
+	if (cmds[0] == NULL){
+		goto cleanup;
+	}
+
+	printf ("You should probably run:\n\n");
+	for (i=0 ; cmds[i] != NULL ; i++){
+		printf ("%s\n", cmds[i]);
+	}
+
+	printf ("\nWould you like to do it now? [y/n] ");
+	scanf ("%c", &ans);
+
+	if (ans == 'y' || ans == 'Y'){
+		printf ("\nRunning restart command[s]..\n\n");
+		for (i=0 ; cmds[i] != NULL ; i++){
+			system(cmds[i]);
+		}
+		printf ("\nDone\n\n");
+	}else{
+		printf ("\n");
+	}
+
+	
+	cleanup:
+		for (i=0 ; cmds[i] != NULL ; i++){
+			free(cmds[i]);
+		}
+		free (cmds);
 }
 
 int main (){
