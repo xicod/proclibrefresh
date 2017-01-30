@@ -40,11 +40,17 @@ set<char*> services_to_restart;
 
 enum init_system my_init_system;
 
+unsigned int broken_entries_count = 0;
+
 void handle_service_to_restart_set (pid_t pid){
 	unordered_map<pid_t, char*>::const_iterator it = pid_service_map.find(pid);
 	if (it != pid_service_map.end()){
 		services_to_restart.insert(it->second);
 	}
+}
+
+void increment_broken_entries_count(){
+	broken_entries_count++;
 }
 
 void handle_entry (lsof_entry *entry){
@@ -69,6 +75,7 @@ void handle_entry (lsof_entry *entry){
 		if ( errno == ENOENT ){
 			printf ("Found that %s (PID=%d) uses a missing %s\n", entry->cmd, entry->pid, entry->filename);
 			handle_service_to_restart_set(entry->pid);
+			increment_broken_entries_count();
 		}else{
 			printf ("Unknown error occured while stat'ing %s\n", entry->filename);
 		}
@@ -85,6 +92,7 @@ void handle_entry (lsof_entry *entry){
 		//printf ("lsof inode: %ld, actual inode: %ld\n", entry->inode, file_stat.st_ino);
 		printf ("Found that %s (PID=%d) uses an outdated %s\n", entry->cmd, entry->pid, entry->filename);
 		handle_service_to_restart_set(entry->pid);
+		increment_broken_entries_count();
 	}
 }
 
@@ -447,13 +455,22 @@ int main (){
 
 	build_pid_service_assoc_map();
 
+	printf("Scanning..\n\n");
+
 	lsof_entries_num = do_lsof();
 
 	time(&exec_end);
 	exec_time_sec = exec_end - exec_start;
 
-	printf ("\nDone.\nExecution took %d seconds.\nHandled %ld lsof entries.\n\n", exec_time_sec, lsof_entries_num);
+	printf("\n\n");
+	if (broken_entries_count > 0){
+		printf ("Found %u broken lib references.\n", broken_entries_count);
+	}else{
+		printf ("No broken lib references were found.\n");
+	}
 
+	printf ("\nDone.\nExecution took %d seconds.\nHandled %ld lsof entries.\n\n", exec_time_sec, lsof_entries_num);
+	
 	handle_service_restart_hint();
 
 	free_pid_service_map();
