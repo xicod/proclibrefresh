@@ -19,8 +19,14 @@
 #include <utility>
 #include <functional>
 #include <set>
+#include <list>
 
 #define BUFFSIZE 1024
+
+
+enum init_system {SYSTEMD, OPENRC, UNIDENTIFIED};
+enum lib_lookup_result {SUCCESS, MISSING, OUTDATED, ERROR, OTHER};
+
 
 typedef struct {
 	long id;
@@ -31,16 +37,23 @@ typedef struct {
 	char filename[256];
 } lsof_entry;
 
-enum init_system {SYSTEMD, OPENRC, UNIDENTIFIED};
+typedef struct {
+	char filename[256];
+	struct stat file_stat;
+	enum lib_lookup_result check_result;
+} so_file_stat;
 
 using namespace std;
 
 unordered_map<pid_t, char*> pid_service_map;
+list<so_file_stat*> lib_files_stat_list;
+
 set<char*> services_to_restart;
 
 enum init_system my_init_system;
 
 unsigned int broken_entries_count = 0;
+unsigned int stat_calls_count = 0;
 
 void handle_service_to_restart_set (pid_t pid){
 	unordered_map<pid_t, char*>::const_iterator it = pid_service_map.find(pid);
@@ -53,47 +66,94 @@ void increment_broken_entries_count(){
 	broken_entries_count++;
 }
 
+so_file_stat *find_so_file_in_checked_list (char *filename){
+	for (list<so_file_stat*>::iterator it = lib_files_stat_list.begin(); it != lib_files_stat_list.end(); ++it){
+		if (strcmp((*it)->filename, filename) == 0){
+			return *it;
+		}
+	}
+
+	return NULL;
+}
+
+
+enum lib_lookup_result check_entry(lsof_entry *entry){
+	
+//	int stat_ret;
+//	struct stat file_stat;
+	
+	so_file_stat *so_file_stat_ptr;
+
+	if ( strstr(entry->filename, "type=") != NULL ){
+		return OTHER;
+	}
+
+	if ( strstr(entry->filename, ".so") == NULL ){
+		return OTHER;
+	}
+
+	// we add to count every file that is stat'd
+	entry->id++;
+
+	so_file_stat_ptr = find_so_file_in_checked_list(entry->filename);
+
+	if (so_file_stat_ptr == NULL){
+		so_file_stat_ptr = (so_file_stat*)(malloc(sizeof(so_file_stat)));
+		lib_files_stat_list.push_back(so_file_stat_ptr);
+
+		strcpy(so_file_stat_ptr->filename, entry->filename);
+		so_file_stat_ptr->check_result = SUCCESS;
+
+		stat_calls_count++;
+
+		if ( stat(entry->filename, &(so_file_stat_ptr->file_stat)) != 0 ){
+			if ( errno == ENOENT ){
+				return (so_file_stat_ptr->check_result = MISSING);
+			}else{
+				return (so_file_stat_ptr->check_result = ERROR);
+			}
+		}
+
+		// not a regular file
+		if ( ((so_file_stat_ptr->file_stat).st_mode & S_IFMT) != S_IFREG ){
+			return (so_file_stat_ptr->check_result = OTHER);
+		}
+	}
+
+	if ( so_file_stat_ptr->check_result == SUCCESS && entry->inode != (so_file_stat_ptr->file_stat).st_ino ){
+		return OUTDATED;
+	}else{
+		return so_file_stat_ptr->check_result;
+	}
+}
+
 void handle_entry (lsof_entry *entry){
 	
 	//printf ("pid: %d, cmd: %s, type: %s, inode: %ld, filename: %s\n", entry->pid, entry->cmd, entry->type, entry->inode, entry->filename);
 
-	int stat_ret;
-	struct stat file_stat;
 
-	if ( strstr(entry->filename, "type=") != NULL ){
-		return;
-	}
-
-	if ( strstr(entry->filename, ".so") == NULL ){
-		return;
-	}
-	
-	// we add to count every file that is stat'd
-	entry->id++;
-
-	if ( (stat_ret = stat(entry->filename, &file_stat)) != 0 ){
-		if ( errno == ENOENT ){
+	switch (check_entry(entry)){
+		case MISSING:
 			printf ("Found that %s (PID=%d) uses a missing %s\n", entry->cmd, entry->pid, entry->filename);
 			handle_service_to_restart_set(entry->pid);
 			increment_broken_entries_count();
-		}else{
+
+			break;
+		case OUTDATED:
+			//printf ("lsof inode: %ld, actual inode: %ld\n", entry->inode, file_stat.st_ino);
+			printf ("Found that %s (PID=%d) uses an outdated %s\n", entry->cmd, entry->pid, entry->filename);
+			handle_service_to_restart_set(entry->pid);
+			increment_broken_entries_count();
+
+			break;
+		case ERROR:
 			printf ("Unknown error occured while stat'ing %s\n", entry->filename);
-		}
-		
-		return;
+
+			break;
+		default:
+			break;
 	}
 
-	// not a regular file
-	if ( (file_stat.st_mode & S_IFMT) != S_IFREG ){
-		return;
-	}
-
-	if ( entry->inode != file_stat.st_ino ){
-		//printf ("lsof inode: %ld, actual inode: %ld\n", entry->inode, file_stat.st_ino);
-		printf ("Found that %s (PID=%d) uses an outdated %s\n", entry->cmd, entry->pid, entry->filename);
-		handle_service_to_restart_set(entry->pid);
-		increment_broken_entries_count();
-	}
 }
 
 void parse_line (char *line, lsof_entry *entry){
@@ -299,6 +359,12 @@ void free_pid_service_map(){
 	}
 }
 
+void free_lib_files_stat_list (){
+	for (list<so_file_stat*>::iterator it = lib_files_stat_list.begin(); it != lib_files_stat_list.end(); ++it){
+		free(*it);
+	}
+}
+
 long do_lsof (){
 	const char *cmd = "lsof -w -F cpin";
 	
@@ -450,7 +516,6 @@ int main (){
 
 	if ( getuid() != 0 ){
 		printf ("\n\nPlease invoke as root. Otherwise output is very partial\n\n");
-		return 0;
 	}
 
 	build_pid_service_assoc_map();
@@ -469,11 +534,13 @@ int main (){
 		printf ("No broken lib references were found.\n");
 	}
 
-	printf ("\nDone.\nExecution took %d seconds.\nHandled %ld lsof entries.\n\n", exec_time_sec, lsof_entries_num);
-	
+	printf ("\nDone.\nExecution took %d seconds.\nHandled %ld lsof entries (%u stat() calls).\n\n", exec_time_sec, lsof_entries_num, stat_calls_count);
+
 	handle_service_restart_hint();
 
 	free_pid_service_map();
+
+	free_lib_files_stat_list();
 
 	return 0;
 }
