@@ -47,6 +47,7 @@ using namespace std;
 
 unordered_map<pid_t, char*> pid_service_map;
 list<so_file_stat*> lib_files_stat_list;
+set<int> docker_owned_pids;
 
 set<char*> services_to_restart;
 
@@ -129,8 +130,9 @@ enum lib_lookup_result check_entry(lsof_entry *entry){
 
 void handle_entry (lsof_entry *entry){
 	
-	//printf ("pid: %d, cmd: %s, type: %s, inode: %ld, filename: %s\n", entry->pid, entry->cmd, entry->type, entry->inode, entry->filename);
-
+	if (docker_owned_pids.find(entry->pid) != docker_owned_pids.end()) {
+		return;
+	}
 
 	switch (check_entry(entry)){
 		case MISSING:
@@ -235,6 +237,28 @@ void handle_procs_file (unordered_map<pid_t, char*> *map, char *filepathandname)
 	cleanup:
 		if (fp) fclose(fp);
 		if (!service_name_used) free(servicename);
+}
+
+void populate_docker_owned_pids_set (){
+	FILE *fp = NULL;
+	char buff[128];
+	pid_t pid;
+	const char *docker_slice_filename = "/sys/fs/cgroup/unified/system.slice/docker.service/cgroup.procs";
+
+	if ( (fp = fopen(docker_slice_filename, "r")) == NULL ){
+		//perror("");
+		goto cleanup;
+	}
+
+	while ( fgets(buff, sizeof(buff), fp) != NULL ) {
+		buff[strlen(buff)-1] = '\0';
+		pid = atoi(buff);
+
+		docker_owned_pids.insert(pid);
+	}
+
+	cleanup:
+		if (fp) fclose(fp);
 }
 
 void find_and_populate_pid_service_map (unordered_map<pid_t, char*> *map, const char *path, const char *filename){
@@ -415,6 +439,7 @@ char **get_services_restart_cmd_systemd (){
 		cmds[0] = cmd_str;
 		cmds[1] = NULL;
 	}else{
+		free(cmd_str);
 		cmds[0] = NULL;
 	}
 	
@@ -517,6 +542,8 @@ int main (){
 	if ( getuid() != 0 ){
 		printf ("\n\nPlease invoke as root. Otherwise output is very partial\n\n");
 	}
+
+	populate_docker_owned_pids_set();
 
 	build_pid_service_assoc_map();
 
